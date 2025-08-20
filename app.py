@@ -1,351 +1,245 @@
+import argparse
+import glob
 import os
-import csv
+import time
 from datetime import datetime
-from pathlib import Path
 
 import cv2
 import numpy as np
-import face_recognition
-from PIL import Image, ImageFile
 
-# Permite cargar JPG/PNG parcialmente truncados
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# ----------------- CONFIG -----------------
-RUTA_DATASET = "dataset"     # dataset/<NombrePersona>/*.jpg|png
-TOLERANCIA = 0.5             # 0.4-0.6 suele ir bien (más bajo = más estricto)
-DOWNSCALE = 0.25             # acelera el procesamiento (1/4 del tamaño)
-MODELO_LOC = "hog"           # 'hog' (CPU) o 'cnn' (si tienes dlib con CUDA)
-# ------------------------------------------
-
-def leer_imagen_simple_y_segura(ruta_img: str):
+def load_models(fd_model_path: str, fr_model_path: str):
     """
-    Método ultra simple para leer imágenes que funciona 100% con face_recognition
+    Carga YuNet (detección) y SFace (reconocimiento) desde rutas .onnx.
     """
-    try:
-        # Método 1: Solo OpenCV, más directo
-        img = cv2.imread(ruta_img, cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError(f"No se pudo leer: {ruta_img}")
-        
-        # Convertir BGR a RGB y asegurar uint8
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
-        
-        return img_rgb
-        
-    except Exception:
-        # Método 2: PIL como backup
-        with Image.open(ruta_img) as pil_img:
-            if pil_img.mode != 'RGB':
-                pil_img = pil_img.convert('RGB')
-            img_array = np.array(pil_img, dtype=np.uint8)
-            return np.ascontiguousarray(img_array)
+    if not os.path.exists(fd_model_path):
+        raise FileNotFoundError(
+            f"No encontré el modelo de detección: {fd_model_path}\n"
+            "Descárgalo desde OpenCV Zoo (YuNet) y verifica la ruta."
+        )
+    if not os.path.exists(fr_model_path):
+        raise FileNotFoundError(
+            f"No encontré el modelo de reconocimiento: {fr_model_path}\n"
+            "Descárgalo desde OpenCV Zoo (SFace) y verifica la ruta."
+        )
 
-def redimensionar_imagen_si_es_muy_grande(img, max_size=1000):
+    detector = cv2.FaceDetectorYN.create(
+        fd_model_path, "", (320, 320), 0.9, 0.3, 5000
+    )
+    recognizer = cv2.FaceRecognizerSF.create(fr_model_path, "")
+
+    if detector is None:
+        raise RuntimeError("Falló la creación de FaceDetectorYN (revisa tu OpenCV).")
+    if recognizer is None:
+        raise RuntimeError("Falló la creación de FaceRecognizerSF (revisa tu OpenCV).")
+
+    return detector, recognizer
+
+
+def detect_faces(detector, img):
     """
-    Redimensiona la imagen si es muy grande para evitar problemas con dlib
+    Corre YuNet y devuelve un arreglo Nx15 (o None si no hay caras).
+    Formato: [x, y, w, h, 10 coords de 5 landmarks, score]
     """
     h, w = img.shape[:2]
-    if h > max_size or w > max_size:
-        # Calcular nuevo tamaño manteniendo aspecto
-        if h > w:
-            new_h, new_w = max_size, int(w * max_size / h)
-        else:
-            new_h, new_w = int(h * max_size / w), max_size
-        
-        print(f"[DEBUG] Redimensionando de {w}x{h} a {new_w}x{new_h}")
-        img = cv2.resize(img, (new_w, new_h))
-    
-    return img
+    detector.setInputSize((w, h))
+    result = detector.detect(img)
+    faces = result[1] if isinstance(result, tuple) else result
+    return faces
 
-# ----- Utilidades de asistencia -----
-def ruta_csv_hoy():
-    fecha = datetime.now().strftime("%Y-%m-%d")
-    return Path(f"asistencia_{fecha}.csv")
 
-def cargar_ya_marcados_hoy():
-    ya = set()
-    p = ruta_csv_hoy()
-    if p.exists():
-        with open(p, newline="", encoding="utf-8") as f:
-            r = csv.reader(f)
-            for fila in r:
-                if not fila:
-                    continue
-                ya.add(fila[0])
-    return ya
-
-def registrar_asistencia(nombre):
-    p = ruta_csv_hoy()
-    ya = cargar_ya_marcados_hoy()
-    if nombre in ya or nombre == "Desconocido":
-        return
-    hora = datetime.now().strftime("%H:%M:%S")
-    with open(p, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([nombre, hora])
-    print(f"[ASISTENCIA] {nombre} @ {hora}")
-
-# ----- Función de face_recognition MUY robusta -----
-def detectar_rostros_seguro(img_rgb, modelo="hog"):
+def pick_largest_face(faces):
     """
-    Detecta rostros con múltiples intentos y configuraciones
+    Devuelve el índice de la cara con mayor área del bbox.
     """
-    # Asegurar que la imagen esté en el formato correcto
-    img_rgb = np.ascontiguousarray(img_rgb, dtype=np.uint8)
-    
-    # Redimensionar si es muy grande
-    img_rgb = redimensionar_imagen_si_es_muy_grande(img_rgb, max_size=800)
-    
-    print(f"[DEBUG] Detectando rostros en imagen: {img_rgb.shape}, dtype: {img_rgb.dtype}")
-    print(f"[DEBUG] Rango de valores: [{img_rgb.min()}, {img_rgb.max()}]")
-    
-    # Intentar con diferentes configuraciones
-    configuraciones = [
-        {"model": modelo, "number_of_times_to_upsample": 0},
-        {"model": "hog", "number_of_times_to_upsample": 0},
-        {"model": "hog", "number_of_times_to_upsample": 1},
-    ]
-    
-    for i, config in enumerate(configuraciones):
-        try:
-            print(f"[DEBUG] Intento {i+1} con configuración: {config}")
-            locs = face_recognition.face_locations(img_rgb, **config)
-            print(f"[DEBUG] ✓ Éxito! Rostros encontrados: {len(locs)}")
-            return locs, img_rgb
-        except Exception as e:
-            print(f"[DEBUG] ✗ Intento {i+1} falló: {e}")
-            continue
-    
-    # Si todo falla, intentar con imagen más pequeña
-    try:
-        print("[DEBUG] Intentando con imagen muy pequeña...")
-        img_tiny = cv2.resize(img_rgb, (200, 200))
-        img_tiny = np.ascontiguousarray(img_tiny, dtype=np.uint8)
-        locs = face_recognition.face_locations(img_tiny, model="hog", number_of_times_to_upsample=0)
-        # Reescalar coordenadas
-        h_orig, w_orig = img_rgb.shape[:2]
-        locs_scaled = []
-        for top, right, bottom, left in locs:
-            top = int(top * h_orig / 200)
-            right = int(right * w_orig / 200)
-            bottom = int(bottom * h_orig / 200)
-            left = int(left * w_orig / 200)
-            locs_scaled.append((top, right, bottom, left))
-        print(f"[DEBUG] ✓ Éxito con imagen pequeña! Rostros: {len(locs_scaled)}")
-        return locs_scaled, img_rgb
-    except Exception as e:
-        print(f"[DEBUG] ✗ También falló con imagen pequeña: {e}")
-    
-    print("[ERROR] TODOS los métodos de detección fallaron")
-    return [], img_rgb
+    if faces is None or len(faces) == 0:
+        return None
+    areas = [(i, faces[i][2] * faces[i][3]) for i in range(faces.shape[0])]
+    return max(areas, key=lambda t: t[1])[0]
 
-def generar_encodings_seguro(img_rgb, locs):
-    """
-    Genera encodings con manejo robusto de errores
-    """
-    try:
-        encs = face_recognition.face_encodings(img_rgb, locs)
-        return encs
-    except Exception as e:
-        print(f"[ERROR] face_encodings falló: {e}")
-        # Intentar con imagen más pequeña
-        try:
-            img_small = redimensionar_imagen_si_es_muy_grande(img_rgb, max_size=500)
-            # Reescalar localizaciones
-            h_orig, w_orig = img_rgb.shape[:2]
-            h_small, w_small = img_small.shape[:2]
-            
-            locs_scaled = []
-            for top, right, bottom, left in locs:
-                top = int(top * h_small / h_orig)
-                right = int(right * w_small / w_orig)
-                bottom = int(bottom * h_small / h_orig)
-                left = int(left * w_small / w_orig)
-                locs_scaled.append((top, right, bottom, left))
-            
-            encs = face_recognition.face_encodings(img_small, locs_scaled)
-            return encs
-        except Exception as e2:
-            print(f"[ERROR] También falló con imagen pequeña: {e2}")
-            return []
 
-# ----- Cargar dataset con máxima robustez -----
-def cargar_encodings(ruta_dataset):
-    nombres_conocidos = []
-    encodings_conocidos = []
-    extensiones = (".jpg", ".jpeg", ".png", ".bmp")
-    
-    total_archivos = 0
-    archivos_procesados = 0
-    
-    print(f"[INFO] Escaneando dataset en: {ruta_dataset}")
-    
-    for root, dirs, files in os.walk(ruta_dataset):
-        partes = Path(root).parts
-        try:
-            idx = partes.index(Path(ruta_dataset).parts[-1])
-            persona = partes[idx+1] if idx+1 < len(partes) else None
-        except ValueError:
-            persona = None
-        if persona is None:
+def build_db_from_folder(detector, recognizer, dataset_dir: str):
+    """
+    Estructura esperada:
+      dataset/
+        PersonaA/*.jpg|png
+        PersonaB/*.jpg|png
+    Devuelve (names, features) donde features es (N, D).
+    """
+    people_dirs = [d for d in sorted(glob.glob(os.path.join(dataset_dir, "*")))
+                   if os.path.isdir(d)]
+    if not people_dirs:
+        raise RuntimeError(f"No hay carpetas dentro de {dataset_dir}")
+
+    names, feats = [], []
+    for pdir in people_dirs:
+        person = os.path.basename(pdir)
+        imgs = sorted(glob.glob(os.path.join(pdir, "*.*")))
+        person_feats = []
+
+        for path in imgs:
+            img = cv2.imread(path)
+            if img is None:
+                print(f"[WARN] No pude leer {path}")
+                continue
+
+            faces = detect_faces(detector, img)
+            if faces is None or len(faces) == 0:
+                print(f"[WARN] No se detectó rostro en {path}")
+                continue
+
+            idx = pick_largest_face(faces)
+            aligned = recognizer.alignCrop(img, faces[idx])  # alinea con landmarks
+            feat = recognizer.feature(aligned)               # embedding
+            feat = np.asarray(feat, dtype=np.float32).reshape(-1)
+            person_feats.append(feat)
+
+        if len(person_feats) == 0:
+            print(f"[WARN] {person}: sin embeddings (carpetas/fotos problemáticas).")
             continue
 
-        archivos_validos = [f for f in files if f.lower().endswith(extensiones)]
-        total_archivos += len(archivos_validos)
-        
-        for archivo in archivos_validos:
-            ruta_img = os.path.join(root, archivo)
-            print(f"\n{'='*50}")
-            print(f"[{archivos_procesados + 1}/{total_archivos}] PROCESANDO: {persona}/{archivo}")
-            print(f"{'='*50}")
+        mean_feat = np.mean(np.stack(person_feats, axis=0), axis=0)  # robustez
+        names.append(person)
+        feats.append(mean_feat)
 
-            try:
-                # 1. Leer imagen
-                print("[1/4] Leyendo imagen...")
-                img_rgb = leer_imagen_simple_y_segura(ruta_img)
-                print(f"[✓] Imagen leída: {img_rgb.shape}")
-                
-                # 2. Detectar rostros
-                print("[2/4] Detectando rostros...")
-                locs, img_procesada = detectar_rostros_seguro(img_rgb, MODELO_LOC)
-                
-                if not locs:
-                    print("[✗] Sin rostros detectados")
-                    continue
-                
-                print(f"[✓] {len(locs)} rostro(s) detectado(s)")
-                
-                # 3. Generar encodings
-                print("[3/4] Generando encodings...")
-                encs = generar_encodings_seguro(img_procesada, locs)
-                
-                if not encs:
-                    print("[✗] Sin encodings generados")
-                    continue
-                
-                print(f"[✓] {len(encs)} encoding(s) generado(s)")
-                
-                # 4. Guardar encodings
-                print("[4/4] Guardando encodings...")
-                for enc in encs:
-                    encodings_conocidos.append(enc)
-                    nombres_conocidos.append(persona)
-                
-                archivos_procesados += 1
-                print(f"[✓] ÉXITO: {persona} procesado correctamente")
+        print(f"[OK] {person}: {len(person_feats)} fotos -> 1 embedding promedio.")
 
-            except Exception as e:
-                print(f"[✗] ERROR CRÍTICO: {e}")
-                import traceback
-                traceback.print_exc()
+    if len(names) == 0:
+        raise RuntimeError("No se generaron embeddings. Revisa tu dataset.")
 
-    print(f"\n[RESUMEN FINAL]")
-    print(f"Archivos encontrados: {total_archivos}")
-    print(f"Archivos procesados exitosamente: {archivos_procesados}")
-    print(f"Encodings generados: {len(encodings_conocidos)}")
-    print(f"Personas únicas: {len(set(nombres_conocidos))}")
-    
-    return np.array(encodings_conocidos), np.array(nombres_conocidos)
+    features = np.stack(feats, axis=0).astype(np.float32)
+    return names, features
 
-def main():
-    print("="*60)
-    print("SISTEMA DE RECONOCIMIENTO FACIAL - VERSIÓN ROBUSTA")
-    print("="*60)
-    
-    # Verificar que el dataset existe
-    if not os.path.exists(RUTA_DATASET):
-        raise RuntimeError(f"La carpeta {RUTA_DATASET} no existe")
-    
-    print(f"[INFO] Cargando encodings desde: {RUTA_DATASET}")
-    encodings_conocidos, nombres_conocidos = cargar_encodings(RUTA_DATASET)
-    
-    if len(encodings_conocidos) == 0:
-        raise RuntimeError("No se generaron encodings. Revisa las imágenes del dataset.")
 
-    print("\n" + "="*60)
-    print("INICIANDO RECONOCIMIENTO EN TIEMPO REAL")
-    print("="*60)
-    print("Presiona 'q' para salir")
-    
-    cap = cv2.VideoCapture(0)
+def save_db(names, features, out_path="faces_db.npz"):
+    np.savez_compressed(out_path, names=np.array(names), features=features)
+    print(f"[OK] Base guardada en {out_path} (personas={len(names)}, dim={features.shape[1]})")
+
+
+def load_db(path="faces_db.npz"):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No encontré la base {path}. Corre primero --mode enroll.")
+    data = np.load(path, allow_pickle=True)
+    names = list(data["names"])
+    features = data["features"].astype(np.float32)
+    return names, features
+
+
+def match_feature(recognizer, feat, db_features, db_names, cosine_thresh: float):
+    """
+    Compara 'feat' contra toda la base usando similitud coseno de SFace.
+    Retorna (best_name, best_score) o ("Unknown", score) si no supera el umbral.
+    """
+    best_name, best_score = "Unknown", -1.0
+    for i in range(db_features.shape[0]):
+        score = recognizer.match(feat, db_features[i], cv2.FaceRecognizerSF_FR_COSINE)
+        if score > best_score:
+            best_score = float(score)
+            best_name = db_names[i]
+    if best_score >= cosine_thresh:
+        return best_name, best_score
+    else:
+        return "Unknown", best_score
+
+
+def draw_face_box(img, face_row, label=None):
+    x, y, w, h = face_row[:4].astype(int)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    # Landmarks: re, le, nt, rcm, lcm
+    pts = face_row[4:14].reshape(-1, 2).astype(int)
+    for (px, py) in pts:
+        cv2.circle(img, (px, py), 2, (255, 0, 255), -1)
+    if label:
+        cv2.rectangle(img, (x, y - 22), (x + w, y), (0, 255, 0), -1)
+        cv2.putText(img, label, (x + 5, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+
+def run_realtime(detector, recognizer, db_path="faces_db.npz",
+                 camera=0, downscale=1.0, log_csv=None, cosine_thresh=0.363):
+    names, features = load_db(db_path)
+    cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW)  # CAP_DSHOW ayuda en Windows
     if not cap.isOpened():
         raise RuntimeError("No se pudo abrir la cámara.")
 
-    ya_marcados = cargar_ya_marcados_hoy()
-    frame_count = 0
+    print("Presiona ESC para salir.")
+    last_log = {}
 
     while True:
         ok, frame = cap.read()
-        if not ok:
-            break
-
-        frame_count += 1
-        
-        # Procesar solo cada N frames para mejor rendimiento
-        if frame_count % 3 != 0:  # procesar cada 3 frames
-            cv2.imshow("Asistencia - Reconocimiento Facial", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+        if not ok or frame is None:
+            print("[WARN] Frame inválido, continuando…")
             continue
 
-        try:
-            # Redimensionar para acelerar
-            small = cv2.resize(frame, (0, 0), fx=DOWNSCALE, fy=DOWNSCALE)
-            rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            rgb_small = np.ascontiguousarray(rgb_small, dtype=np.uint8)
+        frame_show = cv2.resize(frame, None, fx=downscale, fy=downscale,
+                                interpolation=cv2.INTER_LINEAR) if downscale != 1.0 else frame
 
-            # Detectar rostros en frame
-            locs, _ = detectar_rostros_seguro(rgb_small, "hog")
-            
-            if locs:
-                encs = generar_encodings_seguro(rgb_small, locs)
-                
-                for enc, (top, right, bottom, left) in zip(encs, locs):
-                    if enc is None or len(enc) == 0:
-                        continue
-                        
-                    nombre = "Desconocido"
-                    if len(encodings_conocidos) > 0:
-                        dists = face_recognition.face_distance(encodings_conocidos, enc)
-                        if len(dists) > 0:
-                            idx_min = np.argmin(dists)
-                            if dists[idx_min] <= TOLERANCIA:
-                                nombre = nombres_conocidos[idx_min]
+        faces = detect_faces(detector, frame_show)
+        if faces is not None and len(faces) > 0:
+            for i in range(faces.shape[0]):
+                aligned = recognizer.alignCrop(frame_show, faces[i])
+                feat = recognizer.feature(aligned)
+                feat = np.asarray(feat, dtype=np.float32).reshape(-1)
 
-                    # Reescalar coordenadas
-                    top = int(top / DOWNSCALE)
-                    right = int(right / DOWNSCALE)
-                    bottom = int(bottom / DOWNSCALE)
-                    left = int(left / DOWNSCALE)
+                name, score = match_feature(recognizer, feat, features, names, cosine_thresh)
 
-                    # Dibujar rectángulo y nombre
-                    color = (0, 255, 0) if nombre != "Desconocido" else (0, 0, 255)
-                    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                    cv2.rectangle(frame, (left, bottom - 25), (right, bottom), color, cv2.FILLED)
-                    cv2.putText(frame, nombre, (left + 6, bottom - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                label = f"{name} ({score:.3f})" if name != "Unknown" else f"Unknown ({score:.3f})"
+                draw_face_box(frame_show, faces[i], label=label)
 
-                    # Registrar asistencia
-                    if nombre != "Desconocido" and nombre not in ya_marcados:
-                        registrar_asistencia(nombre)
-                        ya_marcados.add(nombre)
+                # Log (simple): evita spamear muchas filas por la misma persona
+                if log_csv and name != "Unknown":
+                    tnow = time.time()
+                    last_t = last_log.get(name, 0)
+                    if tnow - last_t > 5:  # cada 5 s como mínimo
+                        with open(log_csv, "a", encoding="utf-8") as f:
+                            f.write(f"{datetime.now().isoformat(timespec='seconds')},{name},{score:.3f}\n")
+                        last_log[name] = tnow
 
-        except Exception as e:
-            print(f"[ERROR] Frame {frame_count}: {e}")
-
-        cv2.imshow("Asistencia - Reconocimiento Facial", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        cv2.imshow("YuNet + SFace (ESC para salir)", frame_show)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    print("\n[INFO] Sistema finalizado correctamente.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reconocimiento facial con YuNet (detección) + SFace (reconocimiento)."
+    )
+    parser.add_argument("--mode", choices=["enroll", "run"], required=True,
+                        help="enroll: crear base | run: reconocer por webcam")
+    parser.add_argument("--dataset", type=str,
+                        help="Carpeta del dataset (para --mode enroll)")
+    parser.add_argument("--db", type=str, default="faces_db.npz",
+                        help="Ruta del archivo .npz con embeddings")
+    parser.add_argument("--fd_model", type=str, required=True,
+                        help="Ruta al modelo YuNet .onnx (detección)")
+    parser.add_argument("--fr_model", type=str, required=True,
+                        help="Ruta al modelo SFace .onnx (reconocimiento)")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="Índice de cámara para --mode run")
+    parser.add_argument("--downscale", type=float, default=1.0,
+                        help="Factor de reducción de frame (ej. 0.5)")
+    parser.add_argument("--log_csv", type=str, default=None,
+                        help="Archivo CSV para registrar asistencias (opcional)")
+    parser.add_argument("--cosine_thresh", type=float, default=0.363,
+                        help="Umbral de similitud coseno (>= coincide)")
+    args = parser.parse_args()
+
+    detector, recognizer = load_models(args.fd_model, args.fr_model)
+
+    if args.mode == "enroll":
+        if not args.dataset:
+            raise SystemExit("Debes pasar --dataset=carpeta_con_fotos")
+        names, feats = build_db_from_folder(detector, recognizer, args.dataset)
+        save_db(names, feats, args.db)
+
+    elif args.mode == "run":
+        run_realtime(detector, recognizer, db_path=args.db, camera=args.camera,
+                     downscale=args.downscale, log_csv=args.log_csv,
+                     cosine_thresh=args.cosine_thresh)
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"\n[ERROR CRÍTICO] {e}")
-        import traceback
-        traceback.print_exc()
+    main()
